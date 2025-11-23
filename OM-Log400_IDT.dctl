@@ -1,0 +1,116 @@
+// =============================================================================
+// DaVinci Resolve DCTL: OM-Log400 to Linear IDT (v7 Highlight Fix)
+// Fixes clipping/compression around Code Value 700 (90% Ref)
+// =============================================================================
+
+// UIパラメータ定義
+DEFINE_UI_PARAMS(p_Invert, Invert Transform, DCTLUI_CHECK_BOX, 0)
+DEFINE_UI_PARAMS(p_Slope, Slope A, DCTLUI_SLIDER_FLOAT, 22.5, 10.0, 40.0, 0.1)
+DEFINE_UI_PARAMS(p_Scale, Scale C, DCTLUI_SLIDER_FLOAT, 0.20, 0.1, 0.5, 0.001)
+DEFINE_UI_PARAMS(p_Offset, Black Level, DCTLUI_SLIDER_FLOAT, 0.0625, 0.0, 0.15, 0.0001)
+
+// [修正] デフォルト閾値を0.68 (Code ~696) に変更
+// 90%反射率(Code 694)を超えたあたりからリニア延長することで、ハイライトの詰まりを解消する
+DEFINE_UI_PARAMS(p_HighThr, High Threshold, DCTLUI_SLIDER_FLOAT, 0.68, 0.5, 1.0, 0.005)
+
+__DEVICE__ float3 transform(int p_Width, int p_Height, int p_X, int p_Y, float p_R, float p_G, float p_B)
+{
+    // パラメータの安全化
+    const float a = (p_Slope < 0.0001f) ? 0.0001f : p_Slope;
+    const float c = (p_Scale < 0.0001f) ? 0.0001f : p_Scale;
+    const float d = p_Offset;
+    
+    // ハイライト閾値が黒レベルを下回らないよう保護
+    const float h_thr = (p_HighThr < d + 0.01f) ? d + 0.01f : p_HighThr;
+
+    // -----------------------------------------------------------
+    // 係数計算 (Pre-calculate slopes)
+    // -----------------------------------------------------------
+
+    // 1. Shadow Toe Slope (黒レベル地点での傾き)
+    // Log to Linearの微係数: slope = 1 / (a * c)
+    const float toe_slope = 1.0f / (a * c);
+
+    // 2. Highlight Extension Slope (閾値地点での傾きと値)
+    // Linear値 x = (exp((y - d) / c) - 1) / a
+    const float lin_at_high = (_expf((h_thr - d) / c) - 1.0f) / a;
+    
+    // その地点での傾き dx/dy = (1/c) * exp((y - d) / c) / a
+    const float high_slope = _expf((h_thr - d) / c) / (a * c);
+
+    // 逆変換用 (Linear to Log)
+    const float high_slope_inv = 1.0f / high_slope;
+    const float toe_slope_inv  = 1.0f / toe_slope; // = a*c
+
+    float3 out_col = make_float3(p_R, p_G, p_B);
+
+    // ---------------------------------------------------------
+    // Mode: Decode (Log -> Linear)
+    // ---------------------------------------------------------
+    if (p_Invert == 0)
+    {
+        // --- Red ---
+        if (out_col.x < d) {
+            // Shadow Linear Toe (暗部の階調維持)
+            out_col.x = (out_col.x - d) * toe_slope;
+        } else if (out_col.x > h_thr) {
+            // Highlight Linear Extension (ハイライトの白飛び防止・伸長)
+            out_col.x = lin_at_high + (out_col.x - h_thr) * high_slope;
+        } else {
+            // Standard Log Curve
+            out_col.x = (_expf((out_col.x - d) / c) - 1.0f) / a;
+        }
+
+        // --- Green ---
+        if (out_col.y < d) {
+            out_col.y = (out_col.y - d) * toe_slope;
+        } else if (out_col.y > h_thr) {
+            out_col.y = lin_at_high + (out_col.y - h_thr) * high_slope;
+        } else {
+            out_col.y = (_expf((out_col.y - d) / c) - 1.0f) / a;
+        }
+
+        // --- Blue ---
+        if (out_col.z < d) {
+            out_col.z = (out_col.z - d) * toe_slope;
+        } else if (out_col.z > h_thr) {
+            out_col.z = lin_at_high + (out_col.z - h_thr) * high_slope;
+        } else {
+            out_col.z = (_expf((out_col.z - d) / c) - 1.0f) / a;
+        }
+    }
+    // ---------------------------------------------------------
+    // Mode: Encode (Linear -> Log)
+    // ---------------------------------------------------------
+    else
+    {
+        // --- Red ---
+        if (out_col.x < 0.0f) {
+            out_col.x = out_col.x * toe_slope_inv + d;
+        } else if (out_col.x > lin_at_high) {
+            out_col.x = h_thr + (out_col.x - lin_at_high) * high_slope_inv;
+        } else {
+            out_col.x = c * _logf(a * out_col.x + 1.0f) + d;
+        }
+
+        // --- Green ---
+        if (out_col.y < 0.0f) {
+            out_col.y = out_col.y * toe_slope_inv + d;
+        } else if (out_col.y > lin_at_high) {
+            out_col.y = h_thr + (out_col.y - lin_at_high) * high_slope_inv;
+        } else {
+            out_col.y = c * _logf(a * out_col.y + 1.0f) + d;
+        }
+
+        // --- Blue ---
+        if (out_col.z < 0.0f) {
+            out_col.z = out_col.z * toe_slope_inv + d;
+        } else if (out_col.z > lin_at_high) {
+            out_col.z = h_thr + (out_col.z - lin_at_high) * high_slope_inv;
+        } else {
+            out_col.z = c * _logf(a * out_col.z + 1.0f) + d;
+        }
+    }
+
+    return out_col;
+}
